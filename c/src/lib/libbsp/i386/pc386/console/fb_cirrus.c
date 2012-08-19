@@ -1,14 +1,13 @@
 /*
- * Copyright (c) 2012 - Pavel Pisa ( pisa@cmp.felk.cvut.cz )
+ * Copyright (c) 2012 - Alexandru-Sever Horin (alex.sever.h@gmail.com)
  *
  * MODULE DESCRIPTION:
- * This module implements FB driver for "Cirrus GD5446" found in Qemu
- * emulator.
+ * This module implements FB driver for Cirrus GD5446 board.
+ * It is tested to work on QEMU simulator only.
  *
- * The code is based on fb_vga.c written by
- *    Copyright (c) 2000  Rosimildo da Silva ( rdasilva@connecttel.com )
- * and it is inspired by X11 and Linux kernel sources
- *
+ * used for documentation and model code from:
+ *      fb_vga.c - Rosimildo da Silva ( rdasilva@connecttel.com )
+ *      Cirrus xf86 driver
  */
 
 #include <stdlib.h>
@@ -24,187 +23,261 @@
 
 #include <rtems/fb.h>
 
-#include "vga_registers.h"
-
-/* these routines are defined in vgainit.c.*/
-extern void ega_hwinit( void );
-extern void ega_hwterm( void );
-
 /* mutex attribure */
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
-#define FB_CIRRUS_MAX_CARDS 1
+/* screen information for the VGA driver 
+ * standard structures
+ */
+static struct fb_var_screeninfo fb_var;
+static struct fb_fix_screeninfo fb_fix;
+
 
 #define CIRRUS_VENDOR_ID         0x1013
 #define CIRRUS_GD5446_DEVICE_ID  0x00b8
 
-/* video modes
-     640 x 480
-     800 x 600
-     1024 x 768
-     1280 x 1024
-*/
-struct fb_cirrus_modeline {
-  int clock;
-  int hdisplay;
-  int hsync_start;
-  int hsync_end;
-  int htotal;
-  int hskew;
-  int vdisplay;
-  int vsync_start;
-  int vsync_end;
-  int vtotal;
-  int vscan;
-  unsigned int flags;
+typedef struct _DisplayModeRec {
+  struct _DisplayModeRec *prev;
+  struct _DisplayModeRec *next;
+  char *name;                 /* identifier for the mode */
+  // ModeStatus status;
+  int type;
+
+  /* These are the values that the user sees/provides */
+  int Clock;                  /* pixel clock freq (kHz) */
+  int HDisplay;               /* horizontal timing */
+  int HSyncStart;
+  int HSyncEnd;
+  int HTotal;
+  int HSkew;
+  int VDisplay;               /* vertical timing */
+  int VSyncStart;
+  int VSyncEnd;
+  int VTotal;
+  int VScan;
+  int Flags;
+
+  /* These are the values the hardware uses */
+  int ClockIndex;
+  int SynthClock;             /* Actual clock freq to
+   * be programmed  (kHz) */
+  int CrtcHDisplay;
+  int CrtcHBlankStart;
+  int CrtcHSyncStart;
+  int CrtcHSyncEnd;
+  int CrtcHBlankEnd;
+  int CrtcHTotal;
+  int CrtcHSkew;
+  int CrtcVDisplay;
+  int CrtcVBlankStart;
+  int CrtcVSyncStart;
+  int CrtcVSyncEnd;
+  int CrtcVBlankEnd;
+  int CrtcVTotal;
+  int CrtcHAdjusted;
+  int CrtcVAdjusted;
+  int PrivSize;
+  int32_t *Private;
+  int PrivFlags;
+
+  float HSync, VRefresh;
+} DisplayModeRec, *DisplayModePtr;
+
+static DisplayModeRec available_modes[] = {
+    {
+        .Clock      = 31500 ,
+        .HDisplay   = 640 ,
+        .HSyncStart = 664 ,
+        .HSyncEnd   = 704 ,
+        .HTotal     = 832 ,
+        .HSkew      = 0 ,
+        .VDisplay   = 480 ,       /* vertical timing */
+        .VSyncStart = 489 ,
+        .VSyncEnd   = 491 ,
+        .VTotal     = 520 ,
+        .VScan      = 0,
+        .Flags      = 0
+    },
+    {
+        .Clock      = 40000 ,
+        .HDisplay   = 800 ,
+        .HSyncStart = 840 ,
+        .HSyncEnd   = 968 ,
+        .HTotal     = 1056 ,
+        .HSkew      = 0 ,
+        .VDisplay   = 600 ,       /* vertical timing */
+        .VSyncStart = 601 ,
+        .VSyncEnd   = 605 ,
+        .VTotal     = 628 ,
+        .VScan      = 0,
+        .Flags      = 0
+    },
+};
+static DisplayModePtr active_mode;
+
+/* The display mode used for the board hardcoded in the following define
+ * Index in above structure
+ */
+#define CIRRUS_DISPLAY_MODE  0
+
+/* The display bytes per pixel used for the board hardcoded in the following define
+ * Index in above structure
+ */
+#define CIRRUS_DEFAULT_BPP 24
+
+/* cirrus board information */
+struct cirrus_board_str{
+  int    pci_bus;
+  int    pci_device;
+  int    pci_function;
+  void  *reg_base;
 };
 
-struct fb_cirrus_state {
-  int              found;
-  int              pbus;
-  int              pdev;
-  int              pfun;
-  uint32_t         pci_bar[4];
-  struct fb_var_screeninfo fb_var;
-  struct fb_fix_screeninfo fb_fix;
-  void             *mmregs;
-  struct fb_cirrus_modeline *active_mode;
-};
+static struct cirrus_board_str cirrus_board_info;
 
-/*                                1/4bpp   8bpp   15/16bpp  24bpp  32bpp */
-static int fb_cirrus_max_clocks[] = { 135100, 135100,  85500,  85500,      0 };
+/*
+ * get information from the board
+ */
+int
+cirrus_pci_read( struct cirrus_board_str *cirrus_board, uint32_t *mem_base, uint32_t *cirrus_register_base)
+{
+  int r;
 
-static struct fb_cirrus_modeline fb_cirrus_std_modelines[] = {
-  { .clock = 31500,
-    .hdisplay = 640, .hsync_start = 664, .hsync_end = 704, .htotal = 832, .hskew = 0,
-    .vdisplay = 480, .vsync_start = 489, .vsync_end = 492, .vtotal = 520, .vscan = 0,
-    .flags = 0
-  },
-  { .clock = 40000,
-    .hdisplay = 800, .hsync_start = 840, .hsync_end = 968, .htotal = 1056, .hskew = 0,
-    .vdisplay = 600, .vsync_start = 601, .vsync_end = 605, .vtotal = 628, .vscan = 0,
-    .flags = 0
-  },
-  { .clock = 0,
-  },
-};
+  r = pci_read_config_dword(
+      cirrus_board->pci_bus, cirrus_board->pci_device, cirrus_board->pci_function,
+      PCI_BASE_ADDRESS_0, mem_base);
+  if( r != PCIB_ERR_SUCCESS)
+    return RTEMS_UNSATISFIED;
 
-#ifndef FB_CIRRUS_DEFAULT_MODE
-/* TUNABLE - until better place is found, the mode is selected there */
-/* index 0 provides 640x480@60 Hz, index 1 800x600@60 Hz */
-#define FB_CIRRUS_DEFAULT_MODE 0
-#endif
+  r = pci_read_config_dword(
+      cirrus_board->pci_bus, cirrus_board->pci_device, cirrus_board->pci_function,
+      PCI_BASE_ADDRESS_1, cirrus_register_base);
+  if( r != PCIB_ERR_SUCCESS)
+    return RTEMS_UNSATISFIED;
 
-#ifndef FB_CIRRUS_DEFAULT_BPP
-/* Bits per pixel, 8, 16, 24 and 32 are supported */
-/* 8 bit mode requires palete support which is not finished yet */
-#define FB_CIRRUS_DEFAULT_BPP  24
-#endif
+  *mem_base &= PCI_BASE_ADDRESS_MEM_MASK;
+  *cirrus_register_base     &= PCI_BASE_ADDRESS_MEM_MASK;
 
-static struct fb_cirrus_state fb_cirrus[FB_CIRRUS_MAX_CARDS];
+  return RTEMS_SUCCESSFUL;
+}
 
-static int
+inline int
 fb_cirrus_read_config_dword(
-  struct fb_cirrus_state *fbst,
-  unsigned char where,
-  uint32_t     *pval)
+    struct cirrus_board_str *fbst,
+    unsigned char where,
+    uint32_t     *pval)
 {
   return pci_read_config_dword(
-    fbst->pbus, fbst->pdev, fbst->pfun,
-    where, pval);
+      fbst->pci_bus, fbst->pci_device, fbst->pci_function,
+      where, pval);
 }
 
-static int
+inline int
 fb_cirrus_write_config_dword(
-  struct fb_cirrus_state *fbst,
-  unsigned char where,
-  uint32_t     val)
+    struct cirrus_board_str *fbst,
+    unsigned char where,
+    uint32_t     val)
 {
   return pci_write_config_dword(
-    fbst->pbus, fbst->pdev, fbst->pfun,
-    where, val);
+      fbst->pci_bus, fbst->pci_device, fbst->pci_function,
+      where, val);
 }
 
-static void
+inline void
 fb_cirrus_write_reg8 (
-  const struct fb_cirrus_state *fbst,
-  unsigned int reg,
-  unsigned int val)
+    const struct cirrus_board_str *fbst,
+    unsigned int reg,
+    unsigned int val)
 {
-  *(volatile uint8_t*)((char *)fbst->mmregs + reg) = val;
+  *(volatile uint8_t*)((char *)fbst->reg_base + reg) = val;
 }
 
-static void
-fb_cirrus_write_reg32 (
-  const struct fb_cirrus_state *fbst,
-  unsigned int reg,
-  uint32_t val)
-{
-  *(volatile uint32_t*)((char *)fbst->mmregs + reg) = val;
-}
-
-static unsigned int
+inline unsigned int
 fb_cirrus_read_reg8 (
-  const struct fb_cirrus_state *fbst,
-  unsigned int reg)
+    const struct cirrus_board_str *fbst,
+    unsigned int reg)
 {
-  return *(volatile uint8_t*)((char *)fbst->mmregs + reg);
+  return *(volatile uint8_t*)((char *)fbst->reg_base + reg);
 }
 
-static uint32_t
-fb_cirrus_read_reg32 (
-  const struct fb_cirrus_state *fbst,
-  unsigned int reg)
-{
-  return *(volatile uint32_t*)((char *)fbst->mmregs + reg);
-}
-#define SEQ_INDEX 4
-#define SEQ_DATA 5
 
-static void
+#define SEQ_INDEX 0x04
+#define SEQ_DATA 0x05
+inline void
 fb_cirrus_write_seq_reg (
-  const struct fb_cirrus_state *fbst,
-  unsigned int reg,
-  unsigned int val)
+    const struct cirrus_board_str *fbst,
+    unsigned int reg,
+    unsigned int val)
 {
   fb_cirrus_write_reg8(fbst, SEQ_INDEX, reg);
   fb_cirrus_write_reg8(fbst, SEQ_DATA, val);
 }
+inline unsigned int
+fb_cirrus_read_seq_reg (
+    const struct cirrus_board_str *fbst,
+    unsigned int reg)
+{
+  fb_cirrus_write_reg8(fbst, SEQ_INDEX, reg);
+  return fb_cirrus_read_reg8(fbst, SEQ_DATA);
+}
+
+
+
 
 #define CRT_INDEX 0x14
 #define CRT_DATA 0x15
 
-static void
+inline void
 fb_cirrus_write_crt_reg (
-  const struct fb_cirrus_state *fbst,
-  unsigned int reg,
-  unsigned int val)
+    const struct cirrus_board_str *fbst,
+    unsigned int reg,
+    unsigned int val)
 {
   fb_cirrus_write_reg8(fbst, CRT_INDEX, reg);
   fb_cirrus_write_reg8(fbst, CRT_DATA, val);
 }
 
-#define GDC_INDEX 0xe
-#define GDC_DATA 0xf
+inline unsigned int
+fb_cirrus_read_crt_reg (
+    const struct cirrus_board_str *fbst,
+    unsigned int reg)
+{
+  fb_cirrus_write_reg8(fbst, CRT_INDEX, reg);
+  return fb_cirrus_read_reg8(fbst, CRT_DATA);
+}
 
-static void
+
+
+#define GDC_INDEX 0x0E
+#define GDC_DATA 0x0F
+
+inline void
 fb_cirrus_write_gdc_reg (
-  const struct fb_cirrus_state *fbst,
-  unsigned int reg,
-  unsigned int val)
+    const struct cirrus_board_str *fbst,
+    unsigned int reg,
+    unsigned int val)
 {
   fb_cirrus_write_reg8(fbst, GDC_INDEX, reg);
   fb_cirrus_write_reg8(fbst, GDC_DATA, val);
 }
 
+inline unsigned int
+fb_cirrus_read_gdc_reg (
+    const struct cirrus_board_str *fbst,
+    unsigned int reg)
+{
+  fb_cirrus_write_reg8(fbst, GDC_INDEX, reg);
+  return fb_cirrus_read_reg8(fbst, GDC_DATA);
+}
 
-#define VGA_DAC_MASK 0x6
 
-static void
+#define VGA_DAC_MASK 0x06
+
+inline void
 fb_cirrus_write_hdr_reg (
-  const struct fb_cirrus_state *fbst,
-  unsigned int val)
+    const struct cirrus_board_str *fbst,
+    unsigned int val)
 {
   volatile unsigned int dummy __attribute__((unused));
   dummy = fb_cirrus_read_reg8(fbst, VGA_DAC_MASK);
@@ -214,385 +287,419 @@ fb_cirrus_write_hdr_reg (
   fb_cirrus_write_reg8(fbst, VGA_DAC_MASK, val);
 }
 
-static void
-fb_cirrus_set_start_address(
-  struct fb_cirrus_state *fbst,
-  unsigned offset)
-{
-  uint32_t addr;
-  uint8_t tmp;
-
-  addr = offset >> 2;
-  fb_cirrus_write_crt_reg(fbst, 0x0c, (uint8_t)((addr >> 8) & 0xff));
-  fb_cirrus_write_crt_reg(fbst, 0x0d, (uint8_t)(addr & 0xff));
-
-  fb_cirrus_write_reg8(fbst, CRT_INDEX, 0x1b);
-  tmp = fb_cirrus_read_reg8(fbst, CRT_DATA);
-  tmp &= 0xf2;
-  tmp |= (addr >> 16) & 0x01;
-  tmp |= (addr >> 15) & 0x0c;
-  fb_cirrus_write_crt_reg(fbst, 0x1b, tmp);
-  fb_cirrus_write_reg8(fbst, CRT_INDEX, 0x1d);
-  tmp = fb_cirrus_read_reg8(fbst, CRT_DATA);
-  tmp &= 0x7f;
-  tmp |= (addr >> 12) & 0x80;
-  fb_cirrus_write_crt_reg(fbst, 0x1d, tmp);
-}
-
-
-static int
-fb_cirrus_set_crt_mode(
-  struct fb_cirrus_state *fbst,
-  struct fb_cirrus_modeline *mode)
-{
-  int hsyncstart, hsyncend, htotal, hdispend;
-  int vtotal, vdispend;
-  int tmp;
-  int sr07 = 0, hdr = 0;
-  int x, y;
-
-  htotal = mode->htotal / 8;
-  hsyncend = mode->hsync_end / 8;
-  hsyncstart = mode->hsync_start / 8;
-  hdispend = mode->hdisplay / 8;
-
-  vtotal = mode->vtotal;
-  vdispend = mode->vdisplay;
-
-  vdispend -= 1;
-  vtotal -= 2;
-
-  htotal -= 5;
-  hdispend -= 1;
-  hsyncstart += 1;
-  hsyncend += 1;
-
-  fb_cirrus_write_crt_reg(fbst, CRTC_EndVertRetrace, 0x20);
-  fb_cirrus_write_crt_reg(fbst, CRTC_HorzTotal, htotal);
-  fb_cirrus_write_crt_reg(fbst, CRTC_HorzDispEnd, hdispend);
-  fb_cirrus_write_crt_reg(fbst, CRTC_StartHorzRetrace, hsyncstart);
-  fb_cirrus_write_crt_reg(fbst, CRTC_EndHorzRetrace, hsyncend);
-  fb_cirrus_write_crt_reg(fbst, CRTC_VertTotal, vtotal & 0xff);
-  fb_cirrus_write_crt_reg(fbst, CRTC_VertDispEnd, vdispend & 0xff);
-
-  tmp = 0x40;
-  if ((vdispend + 1) & 512)
-    tmp |= 0x20;
-  fb_cirrus_write_crt_reg(fbst, CRTC_MaxScanLine, tmp);
-
-  tmp = 16;
-  if (vtotal & 256)
-    tmp |= 1;
-  if (vdispend & 256)
-    tmp |= 2;
-  if ((vdispend + 1) & 256)
-    tmp |= 8;
-  if (vtotal & 512)
-    tmp |= 32;
-  if (vdispend & 512)
-    tmp |= 64;
-  fb_cirrus_write_crt_reg(fbst, CRTC_Overflow, tmp);
-
-  tmp = 0;
-
-  if ((htotal + 5) & 64)
-    tmp |= 16;
-  if ((htotal + 5) & 128)
-    tmp |= 32;
-  if (vtotal & 256)
-    tmp |= 64;
-  if (vtotal & 512)
-    tmp |= 128;
-
-  fb_cirrus_write_crt_reg(fbst, 0x1A, tmp);
-
-  /* Disable Hercules/CGA compatibility */
-  fb_cirrus_write_crt_reg(fbst, CRTC_ModeCtrl, 0x03);
-
-  fb_cirrus_write_reg8(fbst, SEQ_INDEX, 0x7);
-  sr07 = fb_cirrus_read_reg8(fbst, SEQ_DATA);
-  sr07 &= 0xe0;
-  hdr = 0;
-  switch (fbst->fb_var.bits_per_pixel) {
-    case 8:
-      sr07 |= 0x11;
-      break;
-    case 16:
-      sr07 |= 0xc7; /* has been 0xc1 */
-      hdr = 0xc0;
-      break;
-    case 24:
-      sr07 |= 0x15;
-      hdr = 0xc5;
-      break;
-    case 32:
-      sr07 |= 0x19;
-      hdr = 0xc5;
-      break;
-    default:
-       printk("FBCIRRUS fb_cirrus_set_crt_mode unsuported BPP\n");
-      return -1;
-  }
-
-  fb_cirrus_write_seq_reg(fbst, 0x7, sr07);
-
-  /* Program the pitch */
-  tmp = fbst->fb_fix.line_length / 8;
-  fb_cirrus_write_crt_reg(fbst, CRTC_Offset, tmp);
-
-  /* Enable extended blanking and pitch bits, and enable full memory */
-  tmp = 0x22;
-  tmp |= (fbst->fb_fix.line_length >> 7) & 0x10;
-  tmp |= (fbst->fb_fix.line_length >> 6) & 0x40;
-  fb_cirrus_write_crt_reg(fbst, 0x1b, tmp);
-
-  /* Enable high-colour modes */
-  fb_cirrus_write_gdc_reg(fbst, GDC_Mode, 0x40);
-
-  /* And set graphics mode */
-  fb_cirrus_write_gdc_reg(fbst, GDC_Misc, 0x01);
-
-  fb_cirrus_write_hdr_reg(fbst, hdr);
-
-  fb_cirrus_set_start_address(fbst, 0);
-
-
-  if (1) {
-    uint32_t pixmask;
-
-    if(fbst->fb_var.bits_per_pixel == 32)
-      pixmask = 0xffffff;
-    else
-      pixmask = (1 << fbst->fb_var.bits_per_pixel) - 1;
-
-    printk("FBCIRRUS mode set, test patter output\n");
-
-    /*while(1)*/
-    for(y = 0; y < fbst->fb_var.yres; y++) {
-      for(x = 0; x < fbst->fb_var.xres; x++) {
-        uint32_t color;
-        char *addr = (char *)fbst->fb_fix.smem_start;
-        addr += y * fbst->fb_fix.line_length;
-        addr += x * fbst->fb_var.bits_per_pixel / 8;
-        color = x & 1 ? 0 : y & 1 ? pixmask & 0x000ff00f : pixmask;
-        if(y == fbst->fb_var.yres - 1) {
-          if((x > 0) && (x < fbst->fb_var.xres-1))
-            color = pixmask & 0x00555555;
-        }
-        switch (fbst->fb_var.bits_per_pixel) {
-          case 8:  *(volatile uint8_t*) addr = color;
-                   break;
-          case 16: *(volatile uint16_t*) addr = color;
-                   break;
-          case 24: *(volatile uint32_t*) addr =
-                   (*(volatile uint32_t*) addr & 0xff000000) | color;
-                   break;
-         case 32: *(volatile uint32_t*) addr = color;
-                   break;
-        }
-      }
-    }
-  }
-
-  return 0;
-}
-
-static uint16_t red16[] = {
-   0x0000, 0x0000, 0x0000, 0x0000, 0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa,
-   0x5555, 0x5555, 0x5555, 0x5555, 0xffff, 0xffff, 0xffff, 0xffff
-};
-static uint16_t green16[] = {
-   0x0000, 0x0000, 0xaaaa, 0xaaaa, 0x0000, 0x0000, 0x5555, 0xaaaa,
-   0x5555, 0x5555, 0xffff, 0xffff, 0x5555, 0x5555, 0xffff, 0xffff
-};
-static uint16_t blue16[] = {
-   0x0000, 0xaaaa, 0x0000, 0xaaaa, 0x0000, 0xaaaa, 0x0000, 0xaaaa,
-   0x5555, 0xffff, 0x5555, 0xffff, 0x5555, 0xffff, 0x5555, 0xffff
-};
-
 /* Functionality to support multiple VGA frame buffers can be added easily,
  * but is not supported at this moment because there is no need for two or
  * more "classic" VGA adapters.  Multiple frame buffer drivers may be
  * implemented and If we had implement it they would be named as "/dev/fb0",
  * "/dev/fb1", "/dev/fb2" and so on.
  */
+
 /*
- * fbvga device driver INITIALIZE entry point.
+ * fb_cirrus device driver INITIALIZE entry point.
  */
 rtems_device_driver frame_buffer_initialize(
-  rtems_device_major_number  major,
-  rtems_device_minor_number  minor,
-  void                      *arg
+    rtems_device_major_number  major,
+    rtems_device_minor_number  minor,
+    void                      *arg
 )
 {
   rtems_status_code status;
   int res;
-  struct fb_cirrus_state *fbst;
-  char devname[12];
-  char *p;
 
-  if(minor >= FB_CIRRUS_MAX_CARDS) {
-    printk( "FBCIRRUS initialize -- unsupported minor\n" );
-    return RTEMS_UNSATISFIED;
-  }
+  printk( "FB_CIRRUS -- driver initializing..\n" );
 
-  fbst = &fb_cirrus[minor];
 
   res = pci_find_device(
-    CIRRUS_VENDOR_ID,
-    CIRRUS_GD5446_DEVICE_ID,
-    minor,
-    &fbst->pbus,
-    &fbst->pdev,
-    &fbst->pfun
+      CIRRUS_VENDOR_ID,
+      CIRRUS_GD5446_DEVICE_ID,
+      minor,
+      &cirrus_board_info.pci_bus,
+      &cirrus_board_info.pci_device,
+      &cirrus_board_info.pci_function
   );
 
+
   if ( res != PCIB_ERR_SUCCESS ) {
-    fbst->found = -1;
-    printk( "FBCIRRUS initialize -- device not found\n" );
+      printk( "FB_CIRRUS initialize -- device not found\n" );
+
+      return RTEMS_UNSATISFIED;
+  }
+  else{
+      printk( "FB_CIRRUS -- driver initializing..\n" );
+      /*
+       * Register the device
+       */
+      status = rtems_io_register_name ("/dev/fb0", major, 0);
+      if (status != RTEMS_SUCCESSFUL) {
+          printk("Error registering /dev/fb0 FB_CIRRUS framebuffer device!\n");
+          rtems_fatal_error_occurred( status );
+      }
+
+      return RTEMS_SUCCESSFUL;
+  }
+}
+
+
+
+
+/*
+ * This function is used to initialize the Start Address - the first
+ * displayed location in the video memory.
+ * Usually mandatory
+ */
+void
+cirrus_adjust_frame( struct cirrus_board_str *board, int x, int y)
+{
+  uint32_t Base;
+  uint8_t tmp;
+
+
+  Base = ((y * fb_var.xres + x) >> 3);
+  if (fb_var.bits_per_pixel != 1)
+    Base *= (fb_var.bits_per_pixel >> 2);
+
+  printk("FB_CIRRUS: cirrus_adjust_frame %d %d >>> %d %x\n", x, y, Base, Base);
+
+  if ((Base & ~0x000FFFFF) != 0) {
+      printk("FB_CIRRUS: Internal error: cirrus_adjust_frame: cannot handle overflow\n");
+      return;
+  }
+
+  fb_cirrus_write_crt_reg( board,  0x0C, (Base >> 8) & 0xff);
+  fb_cirrus_write_crt_reg( board,  0x0D, Base & 0xff);
+
+  tmp = fb_cirrus_read_crt_reg( board,  0x1B);
+  tmp &= 0xF2;
+  tmp |= (Base >> 16) & 0x01;
+  tmp |= (Base >> 15) & 0x0C;
+  fb_cirrus_write_crt_reg( board,  0x1B, tmp);
+
+  tmp = fb_cirrus_read_crt_reg( board, 0x1D);
+  tmp &= 0x7F;
+  tmp |= (Base >> 12) & 0x80;
+  fb_cirrus_write_crt_reg( board,  0x1D, tmp);
+}
+
+
+int cirrus_set_mode(DisplayModePtr mode)
+{
+  int depthcode = fb_var.bits_per_pixel;;
+  int width;
+  int HDiv2 = 0, VDiv2 = 0;
+  const struct cirrus_board_str *cirrus_board_ptr = &cirrus_board_info;
+  int temp;
+  int hdr = -1;
+
+  printk("FB_CIRRUS: mode  %d bpp, %d Hz    %d %d %d %d   %d %d %d %d\n",
+      fb_var.bits_per_pixel,
+      mode->Clock,
+      mode->HDisplay,
+      mode->HSyncStart,
+      mode->HSyncEnd,
+      mode->HTotal,
+      mode->VDisplay,
+      mode->VSyncStart,
+      mode->VSyncEnd,
+      mode->VTotal);
+
+  if ( mode->Clock >  85500 ) {
+      /* The actual DAC register value is set later. */
+      /* The CRTC is clocked at VCLK / 2, so we must half the */
+      /* horizontal timings. */
+      if (!mode->CrtcHAdjusted) {
+          mode->HDisplay >>= 1;
+          mode->HSyncStart >>= 1;
+          mode->HTotal >>= 1;
+          mode->HSyncEnd >>= 1;
+          mode->SynthClock >>= 1;
+          mode->CrtcHAdjusted = TRUE;
+      }
+      depthcode += 64;
+      HDiv2 = 1;
+  }
+  if (mode->VTotal >= 1024 ) {
+      /* For non-interlaced vertical timing >= 1024, the vertical timings */
+      /* are divided by 2 and VGA CRTC 0x17 bit 2  is set. */
+      if (!mode->CrtcVAdjusted) {
+          mode->VDisplay >>= 1;
+          mode->VSyncStart >>= 1;
+          mode->VSyncEnd >>= 1;
+          mode->VTotal >>= 1;
+          mode->CrtcVAdjusted = TRUE;
+      }
+      VDiv2 = 1;
+  }
+
+  /****************************************************
+   * Sequential registers
+   */
+  fb_cirrus_write_seq_reg(cirrus_board_ptr, 0x00, 0x00);
+  fb_cirrus_write_seq_reg(cirrus_board_ptr, 0x01, 0x01);
+  fb_cirrus_write_seq_reg(cirrus_board_ptr, 0x02, 0x0F);
+  fb_cirrus_write_seq_reg(cirrus_board_ptr, 0x03, 0x00);
+  fb_cirrus_write_seq_reg(cirrus_board_ptr, 0x04, 0x0E);
+
+  /****************************************************
+   * CRTC Controller Registers
+   */
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x00, (mode->HTotal >> 3) - 5 );
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x01, (mode->HDisplay >> 3) - 1);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x02, (mode->HSyncStart >> 3) - 1);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x03, ((mode->HSyncEnd >> 3) & 0x1F) | 0x80);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x04, (mode->HSyncStart >> 3));
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x05,
+      (((mode->HSyncEnd >> 3) & 0x20 ) << 2 )
+      | (((mode->HSyncEnd >> 3)) & 0x1F));
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x06, (mode->VTotal - 2) & 0xFF);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x07,
+      (((mode->VTotal -2) & 0x100) >> 8 )
+      | (((mode->VDisplay -1) & 0x100) >> 7 )
+      | ((mode->VSyncStart & 0x100) >> 6 )
+      | (((mode->VSyncStart) & 0x100) >> 5 )
+      | 0x10
+      | (((mode->VTotal -2) & 0x200)   >> 4 )
+      | (((mode->VDisplay -1) & 0x200) >> 3 )
+      | ((mode->VSyncStart & 0x200) >> 2 ));
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x08, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x09, ((mode->VSyncStart & 0x200) >>4) | 0x40);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x0A, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x0B, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x0C, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x0D, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x0E, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x0F, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x10, mode->VSyncStart & 0xFF);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x11, (mode->VSyncEnd & 0x0F) | 0x20);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x12, (mode->VDisplay -1) & 0xFF);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x13, 0x00);  /* no interlace */
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x14, 0x00);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x15, mode->VSyncStart & 0xFF);
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x16, (mode->VSyncStart +1) & 0xFF);
+
+  temp = 0xAF;
+  if(VDiv2)
+    temp |= 0x04;
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x17, temp);
+
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x18, 0xFF);
+
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x1A ,
+      (((mode->HTotal >> 3) & 0xC0 ) >> 2)
+      | (((mode->VTotal - 2) & 0x300 ) >> 2));
+
+  width = fb_fix.line_length >> 3;
+  if (fb_var.bits_per_pixel == 1)
+    width <<= 2;
+  if(width >= 0xFF)
+    printk("FB_CIRRUS: Warning line size over the limit ... reduce bpp or width resolution");
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x13,  width);
+  /* Offset extension (see CR13) */
+  temp = fb_cirrus_read_crt_reg( cirrus_board_ptr, 0x1B);
+  temp &= 0xAF;
+  temp |= (width >> (3+4)) & 0x10;
+  temp |= (width >> (3+3)) & 0x40;
+  temp |= 0x22;
+  fb_cirrus_write_crt_reg( cirrus_board_ptr, 0x1B,  temp);
+
+
+  /****************************************************
+   * Sequential register
+   * Enable linear mode and high-res packed pixel mode
+   */
+  temp = fb_cirrus_read_seq_reg( cirrus_board_ptr, 0x07);
+  temp &= 0xe0;
+  switch (depthcode) {
+  case 1:
+  case 4:
+    temp |= 0x10;
+    break;
+  case 8:
+    temp |= 0x11;
+    break;
+  case 64+8:
+  temp |= 0x17;
+  break;
+  case 15:
+    temp |= 0x17;
+    hdr = 0xC0; // 5:5:5 Sierra
+    break;
+  case 16:
+    temp |= 0x17;
+    hdr = 0xC1; // 5:6:5 XGA mode
+    break;
+  case 24:
+    temp |= 0x15;
+    hdr = 0xC5; // 8:8:8 16M colors
+    break;
+  case 32:
+    temp |= 0x19;
+    hdr = 0xC5; // 8:8:8 16M colors
+    break;
+  default:
+    printk("FB_CIRRUS: Cannot Initialize display to requested mode\n");
+    printk("FB_CIRRUS: returning RTEMS_UNSATISFIED on depthcode %d\n", depthcode);
     return RTEMS_UNSATISFIED;
   }
+  fb_cirrus_write_seq_reg( cirrus_board_ptr, 0x07, temp);
+  // this just set  packed pixel mode with according bpp
 
-  printk( "FBCIRRUS -- driver initializing..\n" );
-
-  /*
-   * Register the device
+  /****************************************************
+   * HDR Register
    */
-  p = strcpy(devname, "/dev/fb0");
-  *(--p) = '0' + minor;
+  if(hdr > 0)
+    fb_cirrus_write_hdr_reg( cirrus_board_ptr, hdr);
 
-  status = rtems_io_register_name (devname, major, 0);
-  if (status != RTEMS_SUCCESSFUL) {
-    fbst->found = -1;
-    printk("Error registering /dev/fbX FBCIRRUS framebuffer device!\n");
-    rtems_fatal_error_occurred( status );
-  }
+  /****************************************************
+   * Graphic Data Controller Registers
+   */
+  temp = fb_cirrus_read_gdc_reg( cirrus_board_ptr, 0x12);
+  if (HDiv2)
+    temp |= 0x20;
+  else
+    temp &= ~0x20;
+  fb_cirrus_write_gdc_reg( cirrus_board_ptr, 0x12, temp);
 
-  fbst->found = 1;
 
-  return RTEMS_SUCCESSFUL;
+  /* Enable high-color modes */
+  fb_cirrus_write_gdc_reg(cirrus_board_ptr, 0x05, 0x40);
+
+  /* VGA graphics mode */
+  fb_cirrus_write_gdc_reg(cirrus_board_ptr, 0x06, 0x01);
+
+
+  return TRUE;
+}
+
+void cirrus_prepare_mode( void )
+{
+
+  active_mode = &available_modes[CIRRUS_DISPLAY_MODE];
+
+  fb_var.bits_per_pixel = CIRRUS_DEFAULT_BPP;
+
+  fb_var.xres  = active_mode->HDisplay;
+  fb_var.yres  = active_mode->VDisplay;
+
+  fb_fix.line_length = (fb_var.xres * fb_var.bits_per_pixel + 7) / 8;
+
+  fb_fix.type   = FB_TYPE_PACKED_PIXELS;
+  fb_fix.visual = FB_VISUAL_TRUECOLOR;
+
 }
 
 /*
- * fbvga device driver OPEN entry point
+ * fb_cirrus device driver OPEN entry point
  */
 rtems_device_driver frame_buffer_open(
-  rtems_device_major_number  major,
-  rtems_device_minor_number  minor,
-  void                      *arg
+    rtems_device_major_number  major,
+    rtems_device_minor_number  minor,
+    void                      *arg
 )
 {
-  struct fb_cirrus_state *fbst;
-  int line_bytes;
+  int r;
+  uint32_t smem_start, regs_start;
 
-  if(minor >= FB_CIRRUS_MAX_CARDS) {
-    printk( "FBCIRRUS initialize -- unsupported minor\n" );
-    return RTEMS_UNSATISFIED;
+  if (pthread_mutex_trylock(&mutex)!= 0){
+      printk( "FB_CIRRUS could not lock mutex\n" );
+
+      return RTEMS_UNSATISFIED;
   }
 
-  fbst = &fb_cirrus[minor];
-
-  if (pthread_mutex_trylock(&mutex)!= 0) {
-    printk( "FBCIRRUS open cannot grab mutex.\n" );
+  r = cirrus_pci_read(&cirrus_board_info, &smem_start, &regs_start);
+  if ( r == RTEMS_UNSATISFIED )
     return RTEMS_UNSATISFIED;
+
+  fb_fix.smem_start  = (volatile char *)smem_start;
+  fb_fix.smem_len    = 0x1000000;
+  cirrus_board_info.reg_base = (void *)regs_start;
+
+
+  cirrus_prepare_mode();
+
+  cirrus_set_mode( active_mode );
+
+  cirrus_adjust_frame( &cirrus_board_info, 0, 0);
+
+
+  if (1) {
+      uint32_t pixmask;
+      int x, y;
+
+      if(fb_var.bits_per_pixel == 32)
+        pixmask = 0xffffff;
+      else
+        pixmask = (1 << fb_var.bits_per_pixel) - 1;
+
+      printk("FB_CIRRUS: mode set, test patter output\n");
+
+      /*while(1)*/
+      for(y = 0; y < fb_var.yres; y++) {
+          for(x = 0; x < fb_var.xres; x++) {
+              uint32_t color;
+              char *addr = (char *)fb_fix.smem_start;
+              addr += y * fb_fix.line_length;
+              addr += x * fb_var.bits_per_pixel / 8;
+              color = x & 1 ? 0 : y & 1 ? pixmask & 0x000ff00f : pixmask;
+              if(y == fb_var.yres - 1) {
+                  if((x > 0) && (x < fb_var.xres-1))
+                    color = pixmask & 0x00555555;
+              }
+              switch (fb_var.bits_per_pixel) {
+              case 8:  *(volatile uint8_t*) addr = color;
+              break;
+              case 16: *(volatile uint16_t*) addr = color;
+              break;
+              case 24: *(volatile uint32_t*) addr =
+                  (*(volatile uint32_t*) addr & 0xff000000) | color;
+              break;
+              case 32: *(volatile uint32_t*) addr = color;
+              break;
+              }
+          }
+      }
   }
 
-  printf("FBCIRRUS found %d pbus %d pdev %d pfun %d\n",
-    fbst->found, fbst->pbus, fbst->pdev, fbst->pfun);
 
-  fb_cirrus_read_config_dword(fbst, PCI_BASE_ADDRESS_0, &fbst->pci_bar[0]);
-  fb_cirrus_read_config_dword(fbst, PCI_BASE_ADDRESS_1, &fbst->pci_bar[1]);
-  fb_cirrus_read_config_dword(fbst, PCI_BASE_ADDRESS_2, &fbst->pci_bar[2]);
-  fb_cirrus_read_config_dword(fbst, PCI_BASE_ADDRESS_3, &fbst->pci_bar[3]);
-
-  fbst->pci_bar[0] &= PCI_BASE_ADDRESS_MEM_MASK;
-  fbst->pci_bar[1] &= PCI_BASE_ADDRESS_MEM_MASK;
-
-  printf("FBCIRRUS PCI BARs 0x%08lx 0x%08lx 0x%08lx 0x%08lx\n",
-    fbst->pci_bar[0], fbst->pci_bar[1], fbst->pci_bar[2], fbst->pci_bar[3]);
-
-  if (_CPU_is_paging_enabled()) {
-    _CPU_map_phys_address((void **) &(fbst->fb_fix.smem_start),
-                            (void *)(fbst->pci_bar[0]),
-                            0x1000000 ,
-                            PTE_CACHE_DISABLE | PTE_WRITABLE);
-    _CPU_map_phys_address((void **) &(fbst->mmregs),
-                            (void *)(fbst->pci_bar[1]),
-                            0x1000,
-                            PTE_CACHE_DISABLE | PTE_WRITABLE);
-   } else {
-      fbst->fb_fix.smem_start = (volatile char *)fbst->pci_bar[0];
-      fbst->mmregs = (void *)fbst->pci_bar[1];
-   }
-
-  fbst->fb_fix.smem_len = 0x1000000;
-
-  fbst->fb_fix.type = FB_TYPE_PACKED_PIXELS;
-  fbst->fb_fix.visual = FB_VISUAL_TRUECOLOR;
-
-  printf("FBCIRRUS remapped fb 0x%08lx mmregs 0x%08lx\n",
-    (unsigned long)fbst->fb_fix.smem_start, (unsigned long)fbst->mmregs);
-
-  fbst->active_mode = &fb_cirrus_std_modelines[FB_CIRRUS_DEFAULT_MODE];
-
-  fbst->fb_var.bits_per_pixel = FB_CIRRUS_DEFAULT_BPP;
-
-  fbst->fb_var.xres = fbst->active_mode->hdisplay;
-  fbst->fb_var.yres = fbst->active_mode->vdisplay;
-
-  line_bytes = fbst->fb_var.xres * fbst->fb_var.bits_per_pixel;
-
-  line_bytes = (line_bytes + 7) / 8;
-
-  fbst->fb_fix.line_length = line_bytes;
-
-  fb_cirrus_set_crt_mode(fbst, fbst->active_mode);
-
-  printk( "FBCIRRUS open called.\n" );
   return RTEMS_SUCCESSFUL;
 
 }
 
 /*
- * fbvga device driver CLOSE entry point
+ * fb_cirrus device driver CLOSE entry point
  */
 rtems_device_driver frame_buffer_close(
-  rtems_device_major_number  major,
-  rtems_device_minor_number  minor,
-  void                      *arg
+    rtems_device_major_number  major,
+    rtems_device_minor_number  minor,
+    void                      *arg
 )
 {
   if (pthread_mutex_unlock(&mutex) == 0){
-    /* restore previous state.  for VGA this means return to text mode.
-     * leave out if graphics hardware has been initialized in
-     * frame_buffer_initialize() */
-    printk( "FBCIRRUS close called.\n" );
-    return RTEMS_SUCCESSFUL;
+      /* restore previous state.  for VGA this means return to text mode.
+       * leave out if graphics hardware has been initialized in
+       * frame_buffer_initialize() */
+
+      /* VGA text mode */
+      fb_cirrus_write_gdc_reg(&cirrus_board_info, 0x06, 0x00);
+
+      printk( "FB_CIRRUS: close called.\n" );
+      return RTEMS_SUCCESSFUL;
   }
 
   return RTEMS_UNSATISFIED;
 }
 
 /*
- * fbvga device driver READ entry point.
+ * fb_cirrus device driver READ entry point.
  */
 rtems_device_driver frame_buffer_read(
-  rtems_device_major_number  major,
-  rtems_device_minor_number  minor,
-  void                      *arg
+    rtems_device_major_number  major,
+    rtems_device_minor_number  minor,
+    void                      *arg
 )
 {
-  struct fb_cirrus_state *fbst;
-
-  if(minor >= FB_CIRRUS_MAX_CARDS) {
-    return RTEMS_UNSATISFIED;
-  }
-
-  fbst = &fb_cirrus[minor];
-
   rtems_libio_rw_args_t *rw_args = (rtems_libio_rw_args_t *)arg;
-  rw_args->bytes_moved = ((rw_args->offset + rw_args->count) > fbst->fb_fix.smem_len ) ? (fbst->fb_fix.smem_len - rw_args->offset) : rw_args->count;
-  memcpy(rw_args->buffer, (const void *) (fbst->fb_fix.smem_start + rw_args->offset), rw_args->bytes_moved);
+  rw_args->bytes_moved = ((rw_args->offset + rw_args->count) > fb_fix.smem_len ) ? (fb_fix.smem_len - rw_args->offset) : rw_args->count;
+  memcpy(rw_args->buffer, (const void *) (fb_fix.smem_start + rw_args->offset), rw_args->bytes_moved);
   return RTEMS_SUCCESSFUL;
 }
 
@@ -600,64 +707,26 @@ rtems_device_driver frame_buffer_read(
  * frame_buffer device driver WRITE entry point.
  */
 rtems_device_driver frame_buffer_write(
-  rtems_device_major_number  major,
-  rtems_device_minor_number  minor,
-  void                      *arg
+    rtems_device_major_number  major,
+    rtems_device_minor_number  minor,
+    void                      *arg
 )
 {
-  struct fb_cirrus_state *fbst;
-
-  if(minor >= FB_CIRRUS_MAX_CARDS) {
-    return RTEMS_UNSATISFIED;
-  }
-
-  fbst = &fb_cirrus[minor];
-
   rtems_libio_rw_args_t *rw_args = (rtems_libio_rw_args_t *)arg;
-  rw_args->bytes_moved = ((rw_args->offset + rw_args->count) > fbst->fb_fix.smem_len ) ? (fbst->fb_fix.smem_len - rw_args->offset) : rw_args->count;
-  memcpy( (void *) (fbst->fb_fix.smem_start + rw_args->offset), rw_args->buffer, rw_args->bytes_moved);
+  rw_args->bytes_moved = ((rw_args->offset + rw_args->count) > fb_fix.smem_len ) ? (fb_fix.smem_len - rw_args->offset) : rw_args->count;
+  memcpy( (void *) (fb_fix.smem_start + rw_args->offset), rw_args->buffer, rw_args->bytes_moved);
   return RTEMS_SUCCESSFUL;
 }
 
-static int get_fix_screen_info(struct fb_cirrus_state *fbst, struct fb_fix_screeninfo *info )
+static int get_fix_screen_info( struct fb_fix_screeninfo *info )
 {
-  *info = fbst->fb_fix;
+  *info = fb_fix;
   return 0;
 }
 
-static int get_var_screen_info(struct fb_cirrus_state *fbst, struct fb_var_screeninfo *info )
+static int get_var_screen_info( struct fb_var_screeninfo *info )
 {
-  *info =  fbst->fb_var;
-  return 0;
-}
-
-static int get_palette(struct fb_cirrus_state *fbst, struct fb_cmap *cmap )
-{
-  uint32_t i;
-
-  if ( cmap->start + cmap->len >= 16 )
-    return 1;
-
-  for( i = 0; i < cmap->len; i++ ) {
-    cmap->red[ cmap->start + i ]   = red16[ cmap->start + i ];
-    cmap->green[ cmap->start + i ] = green16[ cmap->start + i ];
-    cmap->blue[ cmap->start + i ]  = blue16[ cmap->start + i ];
-  }
-  return 0;
-}
-
-static int set_palette(struct fb_cirrus_state *fbst, struct fb_cmap *cmap )
-{
-  uint32_t i;
-
-  if ( cmap->start + cmap->len >= 16 )
-    return 1;
-
-  for( i = 0; i < cmap->len; i++ ) {
-    red16[ cmap->start + i ] = cmap->red[ cmap->start + i ];
-    green16[ cmap->start + i ] = cmap->green[ cmap->start + i ];
-    blue16[ cmap->start + i ] = cmap->blue[ cmap->start + i ];
-  }
+  *info =  fb_var;
   return 0;
 }
 
@@ -666,43 +735,37 @@ static int set_palette(struct fb_cirrus_state *fbst, struct fb_cmap *cmap )
  * all services of this interface.
  */
 rtems_device_driver frame_buffer_control(
-  rtems_device_major_number  major,
-  rtems_device_minor_number  minor,
-  void                      *arg
+    rtems_device_major_number  major,
+    rtems_device_minor_number  minor,
+    void                      *arg
 )
 {
   rtems_libio_ioctl_args_t *args = arg;
-  struct fb_cirrus_state *fbst;
 
-  if(minor >= FB_CIRRUS_MAX_CARDS) {
-    return RTEMS_UNSATISFIED;
-  }
-
-  fbst = &fb_cirrus[minor];
-
-  printk( "FBCIRRUS ioctl called, cmd=%x\n", args->command  );
+  printk( "FB_CIRRUS ioctl called, cmd=%x\n", args->command  );
 
   switch( args->command ) {
-    case FBIOGET_FSCREENINFO:
-      args->ioctl_return =  get_fix_screen_info( fbst, ( struct fb_fix_screeninfo * ) args->buffer );
-      break;
-    case FBIOGET_VSCREENINFO:
-      args->ioctl_return =  get_var_screen_info( fbst, ( struct fb_var_screeninfo * ) args->buffer );
-      break;
-    case FBIOPUT_VSCREENINFO:
-      /* not implemented yet*/
-      args->ioctl_return = -1;
-      return RTEMS_UNSATISFIED;
-    case FBIOGETCMAP:
-      args->ioctl_return =  get_palette( fbst, ( struct fb_cmap * ) args->buffer );
-      break;
-    case FBIOPUTCMAP:
-      args->ioctl_return =  set_palette( fbst, ( struct fb_cmap * ) args->buffer );
-      break;
-
-    default:
-     args->ioctl_return = 0;
-     break;
+  case FBIOGET_FSCREENINFO:
+    args->ioctl_return =  get_fix_screen_info( ( struct fb_fix_screeninfo * ) args->buffer );
+    break;
+  case FBIOGET_VSCREENINFO:
+    args->ioctl_return =  get_var_screen_info( ( struct fb_var_screeninfo * ) args->buffer );
+    break;
+  case FBIOPUT_VSCREENINFO:
+    /* not implemented yet*/
+    args->ioctl_return = -1;
+    return RTEMS_UNSATISFIED;
+  case FBIOGETCMAP:
+    /* no palette - truecolor mode*/
+    args->ioctl_return = -1;
+    return RTEMS_UNSATISFIED;
+  case FBIOPUTCMAP:
+    /* no palette - truecolor mode*/
+    args->ioctl_return = -1;
+    return RTEMS_UNSATISFIED;
+  default:
+    args->ioctl_return = 0;
+    break;
   }
   return RTEMS_SUCCESSFUL;
 }
